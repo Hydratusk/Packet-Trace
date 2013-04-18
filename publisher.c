@@ -4,6 +4,7 @@
  * it's role is to notify other nodes about how they can
  * access it.
  */
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -28,6 +29,17 @@
 #include <sys/fcntl.h>
 
 #include <glib.h>
+
+struct _GRelation
+{
+  gint fields;
+  gint current_field;
+  
+  GHashTable   *all_tuples;
+  GHashTable  **hashed_tuple_tables;
+  
+  gint count;
+};
 /*
  * Structure holding info about our server
  *
@@ -48,11 +60,8 @@ struct ccn_info_server {
     struct ccn_closure  closure_where;
     struct ccn_charbuf *prefix_where;
 
-    /* Map of location of interests */
-    struct GHashTable  *interests;
-
-    /* Hash of datas in every place */
-    struct GHashTable  *ips;
+    /* Table of relations */
+    GRelation   *relations;
 
     int                 expire;
     char                host[NI_MAXHOST];
@@ -64,8 +73,8 @@ struct ccn_info_server {
     struct sockaddr_in  serv;
 };
 
-#define SERVER_SUFFIX "where"
-#define WHERE_SUFFIX  "ping"
+#define SERVER_SUFFIX "server"
+#define WHERE_SUFFIX  "where"
 #define BUF_SIZE      64*1024
 
 /*
@@ -216,11 +225,15 @@ int construct_info_response(struct ccn *h, struct ccn_charbuf *data,
  * @return 0 if we are successful for signing the content, else -1.
  */
 int construct_where_response(struct ccn *h, struct ccn_charbuf *data, 
-        const unsigned char *interest_msg, const struct ccn_parsed_interest *pi, struct ccn_info_server *server)
+        const unsigned char *interest_msg, const struct ccn_parsed_interest *pi, struct ccn_info_server *server, const char *buffer)
 {
     struct ccn_charbuf *name = ccn_charbuf_create();
     struct ccn_signing_params sp = CCN_SIGNING_PARAMS_INIT;
     int res;
+    char output[BUF_SIZE+1];
+    int pointer = 0;
+
+    memset( output, '\0', sizeof(output) );
 
     ccn_charbuf_append(name, interest_msg + pi->offset[CCN_PI_B_Name],
             pi->offset[CCN_PI_E_Name] - pi->offset[CCN_PI_B_Name]);
@@ -234,10 +247,21 @@ int construct_where_response(struct ccn *h, struct ccn_charbuf *data,
         ccn_charbuf_append_closer(sp.template_ccnb);
     }
 
-    /*
-     * TODO: Make sure we are adding our IP and Port of the server here
-     */
-    res = ccn_sign_content(h, data, name, &sp, server->host, strlen(server->host));
+    printf("Building out message: %s\n %s\n", buffer, output);
+
+    GTuples *t = g_relation_select( server->relations, buffer, 0 );
+    int i;
+    for ( i = 0; i < t->len; ++i ){
+      const char *ip = g_tuples_index( t, i, 1 );
+      strncpy( output + pointer, ip, strlen( ip ) );
+      pointer += (strlen(ip)+1);
+      output[pointer+1]='\n';
+    }
+
+    printf("Building out message: %s\n %s\n", buffer, output);
+
+    // Now we need to extract the data from our relation database
+    res = ccn_sign_content(h, data, name, &sp, output, strlen(output));
 
     ccn_charbuf_destroy(&sp.template_ccnb);
     ccn_charbuf_destroy(&name);
@@ -317,13 +341,22 @@ enum ccn_upcall_res where_interest(struct ccn_closure *selfp,
        * is or where the server is at.
        */
       if (info_interest_valid(server->prefix_server, info->interest_ccnb, info->pi)) {
+        const unsigned char *buf;
+        char *what = NULL;
+        size_t length;
+
         //construct Data content with given Interest name
         struct ccn_charbuf *data = ccn_charbuf_create();
-        construct_where_response(info->h, data, info->interest_ccnb, info->pi, server);
+        ccn_name_comp_get( info->interest_ccnb, info->interest_comps, info->interest_comps->n-2, &buf, &length);
+
+        what = strdup( (const char*)buf );
+
+        construct_where_response(info->h, data, info->interest_ccnb, info->pi, server, what);
 
         //send response back
         res = ccn_put(info->h, data->buf, data->length);
         ccn_charbuf_destroy(&data);
+        free( what );
 
         // TODO: Do I need this?
         server->count ++;
@@ -406,22 +439,25 @@ void parse_tcp_packet( struct ccn_info_server *server, char *buffer, struct sock
 
   char addr[NI_MAXHOST];
 
-  getnameinfo(dest,
+  getnameinfo((const struct sockaddr*)dest,
       sizeof(struct sockaddr_in),
       addr, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
 
   char *buf = strdup( buffer );
   char *pch = strtok( buf, "\n" );
 
-  fprintf(stderr, "Address is: %s\n", addr );
+  // Remove all the ip instances in our mini database
+  g_relation_delete( server->relations, addr, 1 );
+
   while ( pch != NULL ){
-    g_hash_table_insert( server->interests, pch, 
-        g_slist_append( g_hash_table_lookup( server->interests, pch), addr ));
+    // Add the Data->Ip relationship
+    g_relation_insert( server->relations, strdup(pch), strdup(addr) );
 
     fprintf( stderr, "Got : %s\n", pch );
     pch = strtok( NULL, "\n" );
-
   }
+
+
 
   free(buf);
 }
@@ -472,7 +508,7 @@ void loop( struct ccn_info_server *server ){
     create_tcp_server( server );
 
     while(true){
-      ccn_run(server->ccn, 10);
+      ccn_run(server->ccn, 500);
       tcp_run(server);
     }
 
@@ -528,9 +564,11 @@ void create_ccn_prefixes( struct ccn_info_server *server, char **argv, const cha
  * @param server    our server holding information about everything and beyond
  */
 void create_hash_tables( struct ccn_info_server *server ){
-  server->interests = g_hash_table_new( g_str_hash, g_str_equal );
-  server->ips       = g_hash_table_new( g_str_hash, g_str_equal );
+  server->relations = g_relation_new(2);
+  g_relation_index( server->relations, 0, g_str_hash, g_str_equal );
+  g_relation_index( server->relations, 1, g_str_hash, g_str_equal );
 }
+
 
 /*
  * Main method, Ruling the world since 1972
@@ -575,8 +613,6 @@ int main(int argc, char **argv)
     // Do the generic loop for the server
     loop( &server );
 
-    g_hash_table_destroy(server.interests );
-    g_hash_table_destroy(server.ips );
-
+    g_relation_destroy( server.relations );
     exit(0);
 }

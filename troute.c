@@ -42,6 +42,9 @@ struct ccn_info_server {
     struct ccn_charbuf *prefix_server;
     struct ccn_closure  closure_server;
 
+    struct ccn_charbuf *prefix_where;
+    struct ccn_closure  closure_where;
+
     int                 expire;
     int                 count;
 
@@ -56,7 +59,8 @@ struct ccn_info_server {
 
 };
 
-#define SERVER_SUFFIX "where"
+#define SERVER_SUFFIX "server"
+#define WHERE_SUFFIX  "where"
 #define BUF_SIZE      64*1024
 
 /*
@@ -89,6 +93,7 @@ void loop( struct ccn_info_server *server ){
 
     ccn_destroy(&(server->ccn));
     ccn_charbuf_destroy(&server->prefix_server);
+    ccn_charbuf_destroy(&server->prefix_where);
 }
 
 /*
@@ -121,9 +126,37 @@ void create_ccn_prefixes( struct ccn_info_server *server, char **argv, const cha
         fprintf(stderr, "%s: error constructing ccn URI: %s/%s\n", progname, argv[0], SERVER_SUFFIX);
         exit(1);
     }
+
+    // Append the "/where" to our prefix, we have to add data stuff after it
+    server->prefix_where  = ccn_charbuf_create();
+    res = ccn_name_from_uri(server->prefix_where, argv[0]);
+
+    if (res < 0) {
+        fprintf(stderr, "%s: bad ccn URI: %s\n", progname, argv[0]);
+        exit(1);
+    }
+    if (argv[1] != NULL){
+        fprintf(stderr, "%s warning: extra arguments ignored\n", progname);
+        fprintf(stderr, "%s \n", (char*)argv[1]);
+        fprintf(stderr, "%s \n", (char*)argv[0]);
+    }
+
+    //append "/server" to the given name prefix
+    res = ccn_name_append_str(server->prefix_where, WHERE_SUFFIX);
+    if (res < 0) {
+        fprintf(stderr, "%s: error constructing ccn URI: %s/%s\n", progname, argv[0], SERVER_SUFFIX);
+        exit(1);
+    }
 }
 
 
+/*
+ * Responds that we got from the server in the form of a /server message
+ * 
+ * @param selfp pointer to itself
+ * @param kind  the kind of content that we got, in this case we are expecting CONTENT
+ * @param info  the infor about the content
+ */
 static enum ccn_upcall_res server_interest(struct ccn_closure* selfp,
         enum ccn_upcall_kind kind, struct ccn_upcall_info* info)
 {
@@ -136,10 +169,9 @@ static enum ccn_upcall_res server_interest(struct ccn_closure* selfp,
     case CCN_UPCALL_FINAL:
       break;
     case CCN_UPCALL_CONTENT:
-      ccn_content_get_value( info->content_ccnb, info->pco->offset[CCN_PCO_E], info->pco, &buf, length );
-      ip_port = strdup( buf );
+      ccn_content_get_value( info->content_ccnb, info->pco->offset[CCN_PCO_E], info->pco, &buf, &length );
+      ip_port = strdup( (const char*)buf );
 
-      fprintf(stderr, "Content  : %s\n", ip_port);
       // Extract IP address
       char *tok = strtok( ip_port, ":" );
       
@@ -153,7 +185,7 @@ static enum ccn_upcall_res server_interest(struct ccn_closure* selfp,
       free( ip_port );
 
       server->init = true;
-      break;
+      return CCN_UPCALL_RESULT_INTEREST_CONSUMED;
     default:
       break;
   }
@@ -161,10 +193,52 @@ static enum ccn_upcall_res server_interest(struct ccn_closure* selfp,
   return CCN_UPCALL_RESULT_OK;
 }
 
+/*
+ * Responds that we got from the server in the form of a where message
+ * 
+ * @param selfp pointer to itself
+ * @param kind  the kind of content that we got, in this case we are expecting CONTENT
+ * @param info  the infor about the content
+ */
+static enum ccn_upcall_res where_interest(struct ccn_closure* selfp,
+        enum ccn_upcall_kind kind, struct ccn_upcall_info* info)
+{
+  const unsigned char *buf;
+  char *where = NULL;
+  size_t length;
+  // struct ccn_info_server *server = (struct ccn_info_server*)selfp->data;
+
+  switch(kind) {
+    case CCN_UPCALL_FINAL:
+      break;
+    case CCN_UPCALL_CONTENT:
+      ccn_content_get_value( info->content_ccnb, info->pco->offset[CCN_PCO_E], info->pco, &buf, &length );
+
+      // We got the content the rest is processing it :)
+      where = strdup( (const char*)buf );
+
+      fprintf(stderr, "Content  : %s\n", where );
+      free( where );
+
+      return CCN_UPCALL_RESULT_OK;
+    default:
+      break;
+  }
+
+  return CCN_UPCALL_RESULT_OK;
+}
+
+/*
+ * Create the client that connects to the server
+ *
+ * @param "server" is the client info
+ */
 void create_ccn_daemon( struct ccn_info_server *server ){
-    int res;
     server->closure_server.p  = &server_interest;
     server->closure_server.data = (void*)server;
+
+    server->closure_where.p  = &where_interest;
+    server->closure_where.data = (void*)server;
 
     /* Connect to ccnd */
     server->ccn = ccn_create();
@@ -174,6 +248,11 @@ void create_ccn_daemon( struct ccn_info_server *server ){
     }
 }
 
+/*
+ * Setup the TCP server to interact with the server
+ *
+ * @param "server" is the client info
+ */
 void setup_server( struct ccn_info_server *server ){
   char buffer[64*1024+1];
   server->serv.sin_family = AF_INET;
@@ -191,6 +270,30 @@ void setup_server( struct ccn_info_server *server ){
     close( server->socket );
   }
 }
+
+/*
+ * Setup the where path for CCNx
+ *
+ * @param buffer is the path to the resource we are looking for on the network
+ */
+void processWhere( struct ccn_info_server *server, const char* buffer ){
+  struct ccn_charbuf *prefix_interest = ccn_charbuf_create();
+
+  ccn_charbuf_append_charbuf( prefix_interest, server->prefix_where );
+  ccn_name_append_str( prefix_interest, buffer );
+
+  // Now express your interest and wait for a response
+  // Fetch the ip/port of the server
+  ccn_express_interest( 
+      server->ccn, 
+      prefix_interest,
+      &server->closure_where, 
+      NULL );
+
+  ccn_charbuf_destroy(&prefix_interest);
+  
+}
+
 /*
  * Main method, Ruling the world since 1972
  */
@@ -233,12 +336,19 @@ int main(int argc, char **argv)
         NULL );
 
     while( true ){
-      ccn_run( server.ccn, 500 );
+      char buffer[500];
+      ccn_run( server.ccn, 100 );
+
 
       if ( server.init ) {
         server.init = false;
         setup_server( &server );
       }
+
+      fgets( buffer, 500, stdin );
+      *strchr(buffer, '\n') = '\0';
+
+      processWhere(&server, buffer);
     }
 
     // Do the generic loop for the server
